@@ -1,17 +1,11 @@
 """
-Background farmer for Color Dice Rigged.
+Background farmer for Color Dice Rigged. v1.1
 
-Continuously fetches new rolls from online-dice.com and inserts them
-into the SQLite database. Uses adaptive throttling to avoid Cloudflare
-1015 rate-limits, even from a single server IP.
-
-Tier-based speed degradation:
-  tier 0 (base):   2 workers x 800-1500ms = ~1.7 req/s
-  tier 1 (after 1st block):  1 worker x 2000-3500ms = ~0.4 req/s
-  tier 2 (after 2nd block):  1 worker x 8000-15000ms = ~0.1 req/s
-
-Cooldowns: 60s -> 5 min -> 30 min
-Recovery: 5 min clean -> tier up
+v1.1 changes:
+  - Uses curl_cffi (Chrome TLS impersonation) to bypass Cloudflare bot detection
+  - Falls back to httpx if curl_cffi unavailable
+  - Logs 403 response body for diagnosis
+  - Adds realistic browser headers (Sec-Fetch-*, Referer, Accept-Encoding)
 """
 
 import asyncio
@@ -21,11 +15,20 @@ import time
 import logging
 from typing import Optional, List
 
-import httpx
-
 log = logging.getLogger("cdr.farmer")
 
+# Try curl_cffi first (better Cloudflare bypass via TLS fingerprint)
+try:
+    from curl_cffi.requests import AsyncSession as _CurlSession
+    HAS_CURL_CFFI = True
+    log.info("Using curl_cffi (Chrome 120 TLS impersonation)")
+except ImportError:
+    import httpx
+    HAS_CURL_CFFI = False
+    log.warning("curl_cffi not available, falling back to httpx")
+
 ROLL_BASE = "https://www.online-dice.com/roll-color-dice/"
+SITE_HOME = "https://www.online-dice.com/"
 SITE_TO_NAME = {
     "blue": "Blue", "green": "Green", "red": "Red",
     "purple": "Purple", "darkorange": "Orange", "gold": "Yellow"
@@ -33,18 +36,22 @@ SITE_TO_NAME = {
 DICE_RE = re.compile(r"color:([a-z]+)!important;['\"]\s+class=['\"]df-solid-small-dot-d6-1")
 RESULT_ID_RE = re.compile(r"Result ID:\s*<span[^>]*>([^<]+)</span>", re.IGNORECASE)
 
-# Tiers: (concurrency, delay_min_ms, delay_max_ms)
 TIERS = [
-    (2,  800,  1500),   # tier 0 base
-    (1, 2000,  3500),   # tier 1
-    (1, 8000, 15000),   # tier 2
+    (2,  800,  1500),
+    (1, 2000,  3500),
+    (1, 8000, 15000),
 ]
-COOLDOWNS_SEC = [60, 300, 1800]   # 1min, 5min, 30min
-RECOVERY_QUIET_SEC = 300          # 5 min clean -> tier up
+COOLDOWNS_SEC = [60, 300, 1800]
+RECOVERY_QUIET_SEC = 300
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+]
 
 
 def parse_roll(html: str) -> dict:
-    # narrow to tabletop region
     region = html
     t = html.find('id="tabletop"')
     if t >= 0:
@@ -84,22 +91,27 @@ class Farmer:
         self.cooldown_until = 0
         self.last_block_ts = 0
         self._rolls_in_last_60s = []
-        # http client with cookies (sometimes needed by site)
-        self.client = httpx.AsyncClient(
-            timeout=httpx.Timeout(20.0),
-            headers={
-                "User-Agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                               "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9",
-            },
-            follow_redirects=True,
-        )
+        self._block_body_logged = False
+        self._init_client()
+
+    def _init_client(self):
+        if HAS_CURL_CFFI:
+            self.client = _CurlSession(
+                impersonate="chrome120",
+                timeout=20,
+            )
+            self._is_curl = True
+        else:
+            self.client = httpx.AsyncClient(
+                timeout=httpx.Timeout(20.0),
+                http2=True,
+                follow_redirects=True,
+            )
+            self._is_curl = False
 
     def stop(self):
         self._stop = True
 
-    # ----- adaptive control -----
     def _enter_cooldown(self, reason: str):
         now = time.time()
         if self.cooldown_until > now:
@@ -122,35 +134,65 @@ class Farmer:
                 self.last_block_ts = now if self.tier > 0 else 0
 
     def _current_tier_params(self):
-        c, dmin, dmax = TIERS[min(self.tier, len(TIERS) - 1)]
-        return c, dmin, dmax
+        return TIERS[min(self.tier, len(TIERS) - 1)]
 
     def current_rate(self) -> float:
         now = time.time()
         self._rolls_in_last_60s = [t for t in self._rolls_in_last_60s if now - t < 60]
         return round(len(self._rolls_in_last_60s) / 60.0, 3)
 
-    # ----- HTTP -----
+    def _headers(self, ua: str, referer: str) -> dict:
+        return {
+            "User-Agent": ua,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Referer": referer,
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-User": "?1",
+            "Upgrade-Insecure-Requests": "1",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        }
+
     async def fetch_roll(self, count: int) -> dict:
         url = f"{ROLL_BASE}{count}/?h=pv"
+        ua = random.choice(USER_AGENTS)
+        headers = self._headers(ua, referer=SITE_HOME)
         try:
-            r = await self.client.get(url)
-            body = r.text
-            reason = detect_block(r.status_code, body)
+            if self._is_curl:
+                r = await self.client.get(url, headers=headers, allow_redirects=True)
+                status = r.status_code
+                body = r.text
+            else:
+                r = await self.client.get(url, headers=headers)
+                status = r.status_code
+                body = r.text
+
+            reason = detect_block(status, body)
             if reason:
+                # log first block body once for diagnostics
+                if not self._block_body_logged:
+                    snippet = (body or "")[:500].replace("\n", " ")
+                    log.warning("BLOCK_BODY (status=%d): %s", status, snippet)
+                    self._block_body_logged = True
                 self._enter_cooldown(reason)
-                return {"ok": False, "reason": reason}
+                return {"ok": False, "reason": reason, "status": status}
+
             parsed = parse_roll(body)
             if not parsed["token"] or parsed["count"] != count:
                 return {"ok": False, "reason": "parse_fail"}
             self._rolls_in_last_60s.append(time.time())
+            self._block_body_logged = False  # reset on success
             return {"ok": True, **parsed}
-        except (httpx.HTTPError, asyncio.TimeoutError) as e:
-            return {"ok": False, "reason": f"http_err:{type(e).__name__}"}
+        except Exception as e:
+            return {"ok": False, "reason": f"http_err:{type(e).__name__}:{str(e)[:100]}"}
 
-    # ----- main loop -----
     async def run_forever(self):
-        log.info("Farmer started (rotation=%s)", self.dice_rotation)
+        log.info("Farmer started (rotation=%s, impl=%s)", self.dice_rotation,
+                 "curl_cffi" if self._is_curl else "httpx")
         rotation_idx = 0
         try:
             while not self._stop:
@@ -160,20 +202,24 @@ class Farmer:
                     continue
 
                 concurrency, dmin, dmax = self._current_tier_params()
-                # one cycle: launch `concurrency` workers, each does 1 roll, then sleep
                 tasks = []
                 for _ in range(concurrency):
                     count = self.dice_rotation[rotation_idx % len(self.dice_rotation)]
                     rotation_idx += 1
                     tasks.append(asyncio.create_task(self._one_roll(count)))
                 await asyncio.gather(*tasks, return_exceptions=True)
-                # cool-down between cycles
                 await asyncio.sleep(random.uniform(dmin / 1000.0, dmax / 1000.0))
         except asyncio.CancelledError:
             log.info("Farmer cancelled")
             raise
         finally:
-            await self.client.aclose()
+            try:
+                if self._is_curl:
+                    await self.client.close()
+                else:
+                    await self.client.aclose()
+            except Exception:
+                pass
 
     async def _one_roll(self, count: int):
         r = await self.fetch_roll(count)
@@ -181,16 +227,13 @@ class Farmer:
             combo = f"{r['count']}|{','.join(r['colors'])}"
             self.db.insert_roll(r["token"], combo, r["count"], r["colors"])
 
-    # ----- on-demand burst (called by /api/find on cache miss) -----
     async def burst_find(self, combo_key: str, count: int, colors: List[str],
                          max_rolls: int = 80, timeout_sec: int = 15) -> Optional[str]:
-        """Try to find a matching token quickly. Respects cooldown."""
         end_ts = time.time() + timeout_sec
         rolls = 0
         while time.time() < end_ts and rolls < max_rolls and not self._stop:
             self._maybe_recover()
             if self.cooldown_until > time.time():
-                # do not block long during a request; just return
                 return None
             r = await self.fetch_roll(count)
             rolls += 1
@@ -199,7 +242,6 @@ class Farmer:
                 self.db.insert_roll(r["token"], rc, r["count"], r["colors"])
                 if rc == combo_key:
                     return r["token"]
-            # small gap inside burst
             _, dmin, dmax = self._current_tier_params()
             await asyncio.sleep(random.uniform(max(0.2, dmin / 2000.0), max(0.4, dmax / 2000.0)))
         return None
