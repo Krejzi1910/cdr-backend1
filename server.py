@@ -150,6 +150,44 @@ async def find(
             "hint": "Cache miss for this combo. Background farmer is still building the index — try again in a moment."}
 
 
+# ----------------- /api/submit -----------------
+# Pozwala rozszerzeniu wysyłać tokeny zebrane w Twoim Chrome
+# (residentialne IP omija Cloudflare). Backend tylko przechowuje.
+
+from pydantic import BaseModel, Field
+from typing import List as _ListType
+
+
+class SubmitRoll(BaseModel):
+    token: str = Field(..., min_length=3, max_length=64)
+    count: int = Field(..., ge=2, le=6)
+    colors: _ListType[str] = Field(..., min_length=2, max_length=6)
+
+
+class SubmitBatch(BaseModel):
+    rolls: _ListType[SubmitRoll] = Field(..., min_length=1, max_length=200)
+
+
+VALID_COLORS = {"Blue", "Green", "Red", "Purple", "Orange", "Yellow"}
+
+
+@app.post("/api/submit")
+async def submit(batch: SubmitBatch, authorization: Optional[str] = Header(None)):
+    _check_auth(authorization)
+    inserted = 0
+    for r in batch.rolls:
+        if len(r.colors) != r.count:
+            continue
+        if not all(c in VALID_COLORS for c in r.colors):
+            continue
+        if not r.token.replace("_", "").replace("-", "").isalnum():
+            continue
+        combo = f"{r.count}|{','.join(r.colors)}"
+        if db.insert_roll(r.token, combo, r.count, r.colors):
+            inserted += 1
+    return {"ok": True, "inserted": inserted, "total": db.total_count()}
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=LISTEN_PORT, log_level="info")
