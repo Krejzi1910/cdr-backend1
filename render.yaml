@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: cdr-backend
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python server.py
+    healthCheckPath: /api/health
+    envVars:
+      - key: CDR_API_KEY
+        generateValue: true
+      - key: CDR_DB_PATH
+        value: /tmp/cdr.sqlite
+      - key: PYTHON_VERSION
+        value: 3.11.9
